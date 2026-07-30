@@ -691,10 +691,28 @@ class OptimizadorUI:
             raise RuntimeError(resultado.stderr.strip() or "No se pudo activar el plan de energía")
 
     def optimizar_disco(self):
-        unidad = os.environ.get("SystemDrive", "C:")
-        resultado = self._run_cmd(f"defrag {unidad} /O /L")
-        if resultado.returncode != 0:
-            raise RuntimeError(resultado.stderr.strip() or "No se pudo optimizar el disco")
+        unidad_letra = os.environ.get("SystemDrive", "C:").strip(":")
+        cmd_tipo_disco = (
+            f'powershell -NoProfile -Command "(Get-PhysicalDisk | '
+            f'Where-Object {{$_.DeviceID -in (Get-Partition | Where-Object {{$_.DriveLetter -eq \\"{unidad_letra}\\"}} | '
+            f'Get-Disk | Select-Object -ExpandProperty Number)}}).MediaType"'
+        )
+
+        resultado_tipo = self._run_cmd(cmd_tipo_disco)
+        tipo_disco = resultado_tipo.stdout.strip().lower()
+
+        if "ssd" in tipo_disco:
+            self.root.after(0, self.escribir_log, f"  Detectado SSD ({unidad_letra}:). Ejecutando optimización (TRIM)...")
+            cmd_optimizacion = f"defrag {unidad_letra}: /L"
+        else:
+            self.root.after(0, self.escribir_log, f"  Detectado HDD ({unidad_letra}:). Ejecutando desfragmentación...")
+            cmd_optimizacion = f"defrag {unidad_letra}: /D /U"
+
+        resultado_opt = self._run_cmd(cmd_optimizacion)
+        if resultado_opt.returncode != 0:
+            raise RuntimeError(resultado_opt.stderr.strip() or "No se pudo optimizar el disco")
+        
+        self.root.after(0, self.escribir_log, f"  Resultado de la optimización:\n{resultado_opt.stdout.strip()}")
 
     def vaciar_papelera(self):
         cmd = 'powershell -NoProfile -Command "Clear-RecycleBin -Force -Confirm:$false -ErrorAction SilentlyContinue"'
