@@ -1,0 +1,2 @@
+# Este proyecto no tiene dependencias externas de Python.
+# Este archivo se incluye por buenas prácticas.
