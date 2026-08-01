@@ -147,6 +147,7 @@ class OptimizadorUI:
         self.var_analisis = tk.BooleanVar(value=True)
         self.var_winget = tk.BooleanVar(value=True)
         self.var_registro = tk.BooleanVar(value=False)
+        self.var_servicios = tk.BooleanVar(value=False)
 
         self.snapshot_antes = None
         self.bytes_liberados_temp = 0
@@ -283,6 +284,12 @@ class OptimizadorUI:
             text="Limpiar registro de programas desinstalados (Experimental)",
             variable=self.var_registro,
         ).grid(row=1, column=1, sticky="w", pady=2, padx=(20, 0))
+
+        ttk.Checkbutton(
+            opciones,
+            text="Optimizar servicios de Windows (Avanzado)",
+            variable=self.var_servicios,
+        ).grid(row=2, column=1, sticky="w", pady=2, padx=(20, 0))
 
         marco_progreso = ttk.Frame(contenedor)
         marco_progreso.pack(fill="x", pady=(14, 8))
@@ -508,8 +515,8 @@ class OptimizadorUI:
             shell=True,
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="ignore",
+            encoding="cp1252",  # Usar una codificación común de Windows para evitar errores con tildes
+            errors="replace",
         )
 
     def iniciar(self):
@@ -568,6 +575,8 @@ class OptimizadorUI:
             tareas.append(("Actualización con winget", self.actualizar_con_winget))
         if self.var_registro.get():
             tareas.append(("Análisis de Registro", self.analizar_registro))
+        if self.var_servicios.get():
+            tareas.append(("Optimización de Servicios", self.optimizar_servicios))
         return tareas
 
     def _ejecutar_tareas(self, tareas):
@@ -684,11 +693,19 @@ class OptimizadorUI:
             raise RuntimeError(resultado.stderr.strip() or "No se pudo limpiar DNS")
 
     def activar_maximo_rendimiento(self):
-        # Si el plan no existe, se intenta crearlo antes de activarlo.
-        self._run_cmd(f"powercfg -duplicatescheme {ULTIMATE_PERFORMANCE_GUID}")
+        # Verificar si el plan ya está activo
+        resultado_activo = self._run_cmd("powercfg /getactivescheme")
+        if ULTIMATE_PERFORMANCE_GUID in resultado_activo.stdout:
+            self.root.after(0, self.escribir_log, "  El plan de máximo rendimiento ya está activo.")
+            return
+
+        # Intentar duplicar el esquema si no existe (ignora errores si ya existe)
+        self._run_cmd(f"powercfg /duplicatescheme {ULTIMATE_PERFORMANCE_GUID}")
+        
+        # Intentar activar el plan
         resultado = self._run_cmd(f"powercfg /s {ULTIMATE_PERFORMANCE_GUID}")
         if resultado.returncode != 0:
-            raise RuntimeError(resultado.stderr.strip() or "No se pudo activar el plan de energía")
+            self.root.after(0, self.escribir_log, f"  ADVERTENCIA: No se pudo activar el plan de máximo rendimiento. Esto es normal en algunos portátiles o versiones de Windows. ({resultado.stderr.strip()})")
 
     def optimizar_disco(self):
         unidad_letra = os.environ.get("SystemDrive", "C:").strip(":")
@@ -717,7 +734,8 @@ class OptimizadorUI:
     def vaciar_papelera(self):
         cmd = 'powershell -NoProfile -Command "Clear-RecycleBin -Force -Confirm:$false -ErrorAction SilentlyContinue"'
         resultado = self._run_cmd(cmd)
-        if resultado.returncode != 0:
+        # El código de retorno puede ser no-cero si la papelera ya está vacía. Solo fallar si hay un error real en stderr.
+        if resultado.returncode != 0 and resultado.stderr.strip():
             raise RuntimeError(resultado.stderr.strip() or "No se pudo vaciar la papelera")
 
     def analizar_recursos(self):
@@ -769,49 +787,129 @@ class OptimizadorUI:
             self.root.after(0, self.escribir_log, f"Winget finalizó con código {ret_code}. Puede que no haya nada que actualizar o winget no esté instalado/configurado.")
 
     def analizar_registro(self):
+        """
+        Busca y elimina claves de registro de desinstalación huérfanas.
+        Una clave se considera huérfana si su 'UninstallString' apunta a un ejecutable
+        que ya no existe en el sistema.
+        """
         if not es_admin():
-            raise PermissionError("Se requieren permisos de administrador para limpiar el registro.")
+            raise PermissionError("Se requieren permisos de administrador para esta tarea.")
 
-        self.root.after(0, self.escribir_log, "Iniciando limpieza de registro de programas desinstalados...")
+        self.root.after(0, self.escribir_log, "Iniciando análisis de registro de programas desinstalados...")
         claves_eliminadas = 0
-        
+
         rutas_registro = [
             (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
             (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
         ]
 
         for hive, ruta_base in rutas_registro:
             try:
-                with winreg.OpenKey(hive, ruta_base) as key_base:
+                with winreg.OpenKey(hive, ruta_base, 0, winreg.KEY_READ | winreg.KEY_WRITE) as key_base:
                     for i in range(winreg.QueryInfoKey(key_base)[0]):
-                        nombre_sub_key = winreg.EnumKey(key_base, i)
                         try:
+                            nombre_sub_key = winreg.EnumKey(key_base, i)
                             with winreg.OpenKey(key_base, nombre_sub_key) as sub_key:
-                                display_name, _ = winreg.QueryValueEx(sub_key, "DisplayName")
-                                uninstall_string, _ = winreg.QueryValueEx(sub_key, "UninstallString")
-                                
-                                # Limpiar y normalizar la ruta del desinstalador
-                                ruta_desinstalador = uninstall_string.strip('"').split('"')[0].strip()
+                                display_name = str(winreg.QueryValueEx(sub_key, "DisplayName")[0]).strip()
+                                uninstall_string = str(winreg.QueryValueEx(sub_key, "UninstallString")[0]).strip()
+
+                                if not display_name or not uninstall_string:
+                                    continue
+
+                                # Ignorar componentes de Windows y actualizaciones
+                                if "SystemComponent" in [v[0] for v in iter_key_values(sub_key)] and winreg.QueryValueEx(sub_key, "SystemComponent")[0] == 1:
+                                    continue
+                                if "ParentKeyName" in [v[0] for v in iter_key_values(sub_key)]: # Actualizaciones de Windows
+                                    continue
+
+                                # Extraer la ruta del ejecutable
+                                match = re.match(r'^"([^"]+)"|(\S+)', uninstall_string)
+                                if not match:
+                                    continue
+
+                                ruta_desinstalador = match.group(1) or match.group(2)
+
+                                # Si es un comando MSI, es difícil de verificar, lo asumimos como válido.
+                                if "msiexec.exe" in ruta_desinstalador.lower():
+                                    continue
+
+                                # Si la ruta no es absoluta, no podemos verificarla de forma fiable.
+                                if not os.path.isabs(ruta_desinstalador):
+                                    continue
+
                                 if not os.path.exists(ruta_desinstalador):
-                                    self.root.after(0, self.escribir_log, f"  Clave huérfana encontrada: {display_name.strip()}")
-                                    # La eliminación real se haría aquí, pero es muy arriesgado.
-                                    # Por seguridad, solo informamos. Para borrar, se necesitaría una lógica más robusta.
-                                    # winreg.DeleteKey(key_base, nombre_sub_key) # ¡PELIGROSO!
-                                    self.root.after(0, self.escribir_log, f"  -> Se recomienda eliminar manualmente la clave: {nombre_sub_key}")
-                                    claves_eliminadas += 1 # Contamos como si se fuera a eliminar
+                                    self.root.after(0, self.escribir_log, f"  Clave huérfana: '{display_name}'. Eliminando...")
+                                    try:
+                                        winreg.DeleteKey(key_base, nombre_sub_key)
+                                        self.root.after(0, self.escribir_log, f"  -> Clave '{nombre_sub_key}' eliminada.")
+                                        claves_eliminadas += 1
+                                    except Exception as del_e:
+                                        self.root.after(0, self.escribir_log, f"  -> ERROR al eliminar clave: {del_e}")
+
                         except FileNotFoundError:
                             # Clave no tiene DisplayName o UninstallString, se ignora.
                             continue
+                        except OSError as e:
+                            if e.winerror == 259: # "No more data is available" - ignorar
+                                continue
+                            raise e
                         except Exception as e:
                             self.root.after(0, self.escribir_log, f"  No se pudo procesar la clave {nombre_sub_key}: {e}")
             except FileNotFoundError:
                 continue # La ruta base no existe (ej. en HKCU)
 
-        if claves_eliminadas > 0:
-            self.root.after(0, self.escribir_log, f"Análisis finalizado. Se identificaron {claves_eliminadas} claves de registro huérfanas.")
-        else:
-            self.root.after(0, self.escribir_log, "Análisis finalizado. No se encontraron claves de registro huérfanas obvias.")
+        self.root.after(0, self.escribir_log, f"Análisis de registro finalizado. Se eliminaron {claves_eliminadas} claves huérfanas.")
 
+    def optimizar_servicios(self):
+        """Deshabilita servicios de Windows no esenciales para mejorar el rendimiento."""
+        if not es_admin():
+            raise PermissionError("Se requieren permisos de administrador para esta tarea.")
+
+        servicios_a_deshabilitar = {
+            "DiagTrack": "Servicio de seguimiento de diagnósticos",
+            "dmwappushservice": "Servicio de enrutamiento de mensajes push de WAP",
+            "Fax": "Fax",
+            "RetailDemo": "Servicio de demostración comercial",
+            "MapsBroker": "Agente de mapas descargados",
+            "lfsvc": "Servicio de geolocalización",
+            "XblGameSave": "Guardado de juegos en Xbox Live",
+            "XboxNetApiSvc": "Servicio de red de Xbox Live",
+            "CertPropSvc": "Servicio de propagación de certificados",
+            "SEMgrSvc": "Servicio de administración de pagos y NFC/SE",
+        }
+
+        self.root.after(0, self.escribir_log, "Iniciando optimización de servicios...")
+        servicios_modificados = 0
+
+        for servicio, descripcion in servicios_a_deshabilitar.items():
+            self.root.after(0, self.escribir_log, f"  Intentando deshabilitar '{descripcion}' ({servicio})...")
+            # Primero, detener el servicio (ignora si falla, puede que no esté corriendo)
+            self._run_cmd(f"sc stop {servicio}")
+            # Luego, configurar para que no inicie automáticamente
+            resultado = self._run_cmd(f"sc config {servicio} start=disabled")
+
+            if resultado.returncode == 0:
+                self.root.after(0, self.escribir_log, f"  -> Servicio '{servicio}' deshabilitado.")
+                servicios_modificados += 1
+            else:
+                # El error 1060 indica que el servicio no existe, lo cual es normal en algunas versiones de Windows.
+                if "1060" in resultado.stderr:
+                    self.root.after(0, self.escribir_log, f"  -> Servicio '{servicio}' no encontrado (se omite).")
+                else:
+                    self.root.after(0, self.escribir_log, f"  -> No se pudo deshabilitar '{servicio}': {resultado.stderr.strip()}")
+
+        self.root.after(0, self.escribir_log, f"Optimización de servicios finalizada. {servicios_modificados} servicios fueron deshabilitados.")
+
+def iter_key_values(key):
+    """Iterador para los valores de una clave de registro."""
+    i = 0
+    while True:
+        try:
+            yield winreg.EnumValue(key, i)
+            i += 1
+        except OSError:
+            break
 
 def main():
     if not es_windows():

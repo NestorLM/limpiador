@@ -14,6 +14,16 @@ if %errorlevel% neq 0 (
     goto :eof
 )
 
+echo [INFO] Limpiando compilaciones anteriores...
+if exist "dist" (
+    echo      - Eliminando directorio 'dist'
+    rd /s /q "dist"
+)
+if exist "build" (
+    echo      - Eliminando directorio 'build'
+    rd /s /q "build"
+)
+
 echo [INFO] Compilando optimizador_windows.py en un solo ejecutable...
 py -3 -m PyInstaller --clean --onefile --windowed --name OptimizadorWindows --icon=NONE optimizador_windows.py
 
